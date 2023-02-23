@@ -1,17 +1,30 @@
+# Copyright 2020 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
 import unittest
 
 import timeout_decorator
 
-from transformers import is_torch_available
-from transformers.file_utils import cached_property
-from transformers.testing_utils import require_torch
+from ..testing_utils import require_torch
+from ..utils import cached_property, is_torch_available
 
 
 if is_torch_available():
     import torch
 
-    from transformers import MarianConfig, MarianMTModel
+    from ..models.marian import MarianConfig, MarianMTModel
 
 
 @require_torch
@@ -60,7 +73,6 @@ class GenerationUtilsTest(unittest.TestCase):
 
     @timeout_decorator.timeout(10)
     def test_postprocess_next_token_scores_large_bad_words_list(self):
-
         config = self.config
         model = self.model
         # Initialize an input id tensor with batch size 8 and sequence length 12

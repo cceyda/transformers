@@ -1,3 +1,16 @@
+# Copyright 2020 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tensorflow trainer class."""
 
 import datetime
@@ -6,15 +19,32 @@ import os
 import warnings
 from typing import Callable, Dict, Optional, Tuple
 
+from .utils import ENV_VARS_TRUE_VALUES
+
+
+# Integrations must be imported before ML frameworks:
+# isort: off
+from .integrations import (
+    is_comet_available,
+    is_wandb_available,
+)
+
+# isort: on
+
 import numpy as np
 import tensorflow as tf
-from packaging.version import parse
 from tensorflow.python.distribute.values import PerReplica
 
-from .integrations import is_comet_available, is_wandb_available
 from .modeling_tf_utils import TFPreTrainedModel
 from .optimization_tf import GradientAccumulator, create_optimizer
-from .trainer_utils import PREFIX_CHECKPOINT_DIR, EvalPrediction, PredictionOutput, set_seed
+from .trainer_utils import (
+    PREFIX_CHECKPOINT_DIR,
+    EvalPrediction,
+    IntervalStrategy,
+    PredictionOutput,
+    enable_full_determinism,
+    set_seed,
+)
 from .training_args_tf import TFTrainingArguments
 from .utils import logging
 
@@ -30,39 +60,35 @@ logger = logging.get_logger(__name__)
 
 class TFTrainer:
     """
-    TFTrainer is a simple but feature-complete training and eval loop for TensorFlow,
-    optimized for 🤗 Transformers.
+    TFTrainer is a simple but feature-complete training and eval loop for TensorFlow, optimized for 🤗 Transformers.
 
     Args:
-        model (:class:`~transformers.TFPreTrainedModel`):
+        model ([`TFPreTrainedModel`]):
             The model to train, evaluate or use for predictions.
-        args (:class:`~transformers.TFTrainingArguments`):
+        args ([`TFTrainingArguments`]):
             The arguments to tweak training.
-        train_dataset (:class:`~tf.data.Dataset`, `optional`):
-            The dataset to use for training. The dataset should yield tuples of ``(features, labels)`` where
-            ``features`` is a dict of input features and ``labels`` is the labels. If ``labels`` is a tensor, the loss is
-            calculated by the model by calling ``model(features, labels=labels)``. If ``labels`` is a dict, such as when
-            using a QuestionAnswering head model with multiple targets, the loss is instead calculated by calling
-            ``model(features, **labels)``.
-        eval_dataset (:class:`~tf.data.Dataset`, `optional`):
-            The dataset to use for evaluation. The dataset should yield tuples of ``(features, labels)`` where
-            ``features`` is a dict of input features and ``labels`` is the labels. If ``labels`` is a tensor, the loss is
-            calculated by the model by calling ``model(features, labels=labels)``. If ``labels`` is a dict, such as when
-            using a QuestionAnswering head model with multiple targets, the loss is instead calculated by calling
-            ``model(features, **labels)``.
-        compute_metrics (:obj:`Callable[[EvalPrediction], Dict]`, `optional`):
-            The function that will be used to compute metrics at evaluation. Must take a
-            :class:`~transformers.EvalPrediction` and return a dictionary string to metric values.
-        tb_writer (:obj:`tf.summary.SummaryWriter`, `optional`):
+        train_dataset ([`~tf.data.Dataset`], *optional*):
+            The dataset to use for training. The dataset should yield tuples of `(features, labels)` where `features`
+            is a dict of input features and `labels` is the labels. If `labels` is a tensor, the loss is calculated by
+            the model by calling `model(features, labels=labels)`. If `labels` is a dict, such as when using a
+            QuestionAnswering head model with multiple targets, the loss is instead calculated by calling
+            `model(features, **labels)`.
+        eval_dataset ([`~tf.data.Dataset`], *optional*):
+            The dataset to use for evaluation. The dataset should yield tuples of `(features, labels)` where `features`
+            is a dict of input features and `labels` is the labels. If `labels` is a tensor, the loss is calculated by
+            the model by calling `model(features, labels=labels)`. If `labels` is a dict, such as when using a
+            QuestionAnswering head model with multiple targets, the loss is instead calculated by calling
+            `model(features, **labels)`.
+        compute_metrics (`Callable[[EvalPrediction], Dict]`, *optional*):
+            The function that will be used to compute metrics at evaluation. Must take a [`EvalPrediction`] and return
+            a dictionary string to metric values.
+        tb_writer (`tf.summary.SummaryWriter`, *optional*):
             Object to write to TensorBoard.
-        optimizers (:obj:`Tuple[tf.keras.optimizers.Optimizer, tf.keras.optimizers.schedules.LearningRateSchedule]`, `optional`):
+        optimizers (`Tuple[tf.keras.optimizers.Optimizer, tf.keras.optimizers.schedules.LearningRateSchedule]`, *optional*):
             A tuple containing the optimizer and the scheduler to use. The optimizer default to an instance of
-            :class:`tf.keras.optimizers.Adam` if :obj:`args.weight_decay_rate` is 0 else an instance of
-            :class:`~transformers.AdamWeightDecay`. The scheduler will default to an instance of
-            :class:`tf.keras.optimizers.schedules.PolynomialDecay` if :obj:`args.num_warmup_steps` is 0 else
-            an instance of :class:`~transformers.WarmUp`.
-        kwargs:
-            Deprecated keyword arguments.
+            [`tf.keras.optimizers.Adam`] if `args.weight_decay_rate` is 0 else an instance of [`AdamWeightDecay`]. The
+            scheduler will default to an instance of [`tf.keras.optimizers.schedules.PolynomialDecay`] if
+            `args.num_warmup_steps` is 0 else an instance of [`WarmUp`].
     """
 
     def __init__(
@@ -77,13 +103,7 @@ class TFTrainer:
             None,
             None,
         ),
-        **kwargs,
     ):
-        assert parse(tf.__version__).release >= (2, 2, 0), (
-            "You need to run the TensorFlow trainer with at least the version 2.2.0, your version is %r "
-            % tf.__version__
-        )
-
         self.model = model
         self.args = args
         self.train_dataset = train_dataset
@@ -93,13 +113,15 @@ class TFTrainer:
         self.gradient_accumulator = GradientAccumulator()
         self.global_step = 0
         self.epoch_logging = 0
-        if "prediction_loss_only" in kwargs:
-            warnings.warn(
-                "Passing `prediction_loss_only` as a keyword argument is deprecated and won't be possible in a future version. Use `args.prediction_loss_only` instead.",
-                FutureWarning,
-            )
-            self.args.prediction_loss_only = kwargs.pop("prediction_loss_only")
-        assert kwargs == {}, f"Unexpected keyword arguments: {list(kwargs.keys())}."
+        self.eval_loss = tf.keras.metrics.Sum()
+
+        warnings.warn(
+            "The class `TFTrainer` is deprecated and will be removed in version 5 of Transformers. "
+            "We recommend using native Keras instead, by calling methods like `fit()` and `predict()` "
+            "directly on the model object. Detailed examples of the Keras style can be found in our "
+            "examples at https://github.com/huggingface/transformers/tree/main/examples/tensorflow",
+            FutureWarning,
+        )
 
         if tb_writer is not None:
             self.tb_writer = tb_writer
@@ -108,10 +130,10 @@ class TFTrainer:
 
         if is_wandb_available():
             self.setup_wandb()
-        elif os.environ.get("WANDB_DISABLED") != "true":
+        elif os.getenv("WANDB_DISABLED", "").upper() not in ENV_VARS_TRUE_VALUES:
             logger.info(
                 "You are instantiating a Trainer but W&B is not installed. To use wandb logging, "
-                "run `pip install wandb; wandb login` see https://docs.wandb.com/huggingface."
+                "run `pip install wandb && wandb login` see https://docs.wandb.com/huggingface."
             )
 
         if is_comet_available():
@@ -122,11 +144,11 @@ class TFTrainer:
                 "see https://www.comet.ml/docs/python-sdk/huggingface/"
             )
 
-        set_seed(self.args.seed)
+        enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
 
     def get_train_tfdataset(self) -> tf.data.Dataset:
         """
-        Returns the training :class:`~tf.data.Dataset`.
+        Returns the training [`~tf.data.Dataset`].
 
         Subclass and override this method if you want to inject some custom behavior.
         """
@@ -134,7 +156,7 @@ class TFTrainer:
             raise ValueError("Trainer: training requires a train_dataset.")
 
         self.total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
-        self.num_train_examples = tf.data.experimental.cardinality(self.train_dataset).numpy()
+        self.num_train_examples = self.train_dataset.cardinality().numpy()
 
         if self.num_train_examples < 0:
             raise ValueError("The training dataset must have an asserted cardinality")
@@ -150,15 +172,15 @@ class TFTrainer:
 
     def get_eval_tfdataset(self, eval_dataset: Optional[tf.data.Dataset] = None) -> tf.data.Dataset:
         """
-        Returns the evaluation :class:`~tf.data.Dataset`.
+        Returns the evaluation [`~tf.data.Dataset`].
 
         Args:
-            eval_dataset (:class:`~tf.data.Dataset`, `optional`):
-                If provided, will override `self.eval_dataset`. The dataset should yield tuples of ``(features,
-                labels)`` where ``features`` is a dict of input features and ``labels`` is the labels. If ``labels``
-                is a tensor, the loss is calculated by the model by calling ``model(features, labels=labels)``. If
-                ``labels`` is a dict, such as when using a QuestionAnswering head model with multiple targets, the
-                loss is instead calculated by calling ``model(features, **labels)``.
+            eval_dataset ([`~tf.data.Dataset`], *optional*):
+                If provided, will override *self.eval_dataset*. The dataset should yield tuples of `(features, labels)`
+                where `features` is a dict of input features and `labels` is the labels. If `labels` is a tensor, the
+                loss is calculated by the model by calling `model(features, labels=labels)`. If `labels` is a dict,
+                such as when using a QuestionAnswering head model with multiple targets, the loss is instead calculated
+                by calling `model(features, **labels)`.
 
         Subclass and override this method if you want to inject some custom behavior.
         """
@@ -166,7 +188,7 @@ class TFTrainer:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        num_examples = tf.data.experimental.cardinality(eval_dataset).numpy()
+        num_examples = eval_dataset.cardinality().numpy()
 
         if num_examples < 0:
             raise ValueError("The training dataset must have an asserted cardinality")
@@ -183,31 +205,26 @@ class TFTrainer:
 
     def get_test_tfdataset(self, test_dataset: tf.data.Dataset) -> tf.data.Dataset:
         """
-        Returns a test :class:`~tf.data.Dataset`.
+        Returns a test [`~tf.data.Dataset`].
 
         Args:
-            test_dataset (:class:`~tf.data.Dataset`):
-                The dataset to use. The dataset should yield tuples of ``(features, labels)`` where ``features`` is
-                a dict of input features and ``labels`` is the labels. If ``labels`` is a tensor, the loss is
-                calculated by the model by calling ``model(features, labels=labels)``. If ``labels`` is a dict, such
-                as when using a QuestionAnswering head model with multiple targets, the loss is instead calculated
-                by calling ``model(features, **labels)``.
+            test_dataset ([`~tf.data.Dataset`]):
+                The dataset to use. The dataset should yield tuples of `(features, labels)` where `features` is a dict
+                of input features and `labels` is the labels. If `labels` is a tensor, the loss is calculated by the
+                model by calling `model(features, labels=labels)`. If `labels` is a dict, such as when using a
+                QuestionAnswering head model with multiple targets, the loss is instead calculated by calling
+                `model(features, **labels)`.
 
         Subclass and override this method if you want to inject some custom behavior.
         """
 
-        num_examples = tf.data.experimental.cardinality(test_dataset).numpy()
+        num_examples = test_dataset.cardinality().numpy()
 
         if num_examples < 0:
             raise ValueError("The training dataset must have an asserted cardinality")
 
-        approx = math.floor if self.args.dataloader_drop_last else math.ceil
-        steps = approx(num_examples / self.args.eval_batch_size)
-        ds = (
-            test_dataset.repeat()
-            .batch(self.args.eval_batch_size, drop_remainder=self.args.dataloader_drop_last)
-            .prefetch(tf.data.experimental.AUTOTUNE)
-        )
+        steps = math.ceil(num_examples / self.args.eval_batch_size)
+        ds = test_dataset.batch(self.args.eval_batch_size).prefetch(tf.data.experimental.AUTOTUNE)
 
         return self.args.strategy.experimental_distribute_dataset(ds), steps, num_examples
 
@@ -216,38 +233,40 @@ class TFTrainer:
         Setup the optimizer and the learning rate scheduler.
 
         We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
-        TFTrainer's init through :obj:`optimizers`, or subclass and override this method.
+        TFTrainer's init through `optimizers`, or subclass and override this method.
         """
         if not self.optimizer and not self.lr_scheduler:
+            warmup_steps = (
+                self.args.warmup_steps
+                if self.args.warmup_steps > 0
+                else math.ceil(num_training_steps * self.args.warmup_ratio)
+            )
+
             self.optimizer, self.lr_scheduler = create_optimizer(
                 self.args.learning_rate,
                 num_training_steps,
-                self.args.warmup_steps,
+                warmup_steps,
                 adam_beta1=self.args.adam_beta1,
                 adam_beta2=self.args.adam_beta2,
                 adam_epsilon=self.args.adam_epsilon,
                 weight_decay_rate=self.args.weight_decay,
+                power=self.args.poly_power,
             )
 
     def setup_wandb(self):
         """
         Setup the optional Weights & Biases (`wandb`) integration.
 
-        One can subclass and override this method to customize the setup if needed. Find more information
-        `here <https://docs.wandb.com/huggingface>`__. You can also override the following environment variables:
+        One can subclass and override this method to customize the setup if needed. Find more information `here
+        <https://docs.wandb.com/huggingface>`__. You can also override the following environment variables:
 
         Environment:
             WANDB_PROJECT:
-                (Optional): str - "huggingface" by default, set this to a custom string to store results in a different project
+                (Optional): str - "huggingface" by default, set this to a custom string to store results in a different
+                project.
             WANDB_DISABLED:
-                (Optional): boolean - defaults to false, set to "true" to disable wandb entirely
+                (Optional): boolean - defaults to false, set to "true" to disable wandb entirely.
         """
-        if hasattr(self, "_setup_wandb"):
-            warnings.warn(
-                "The `_setup_wandb` method is deprecated and won't be called in a future version, define `setup_wandb` in your subclass.",
-                FutureWarning,
-            )
-            return self._setup_wandb()
 
         logger.info('Automatic Weights & Biases logging enabled, to disable set os.environ["WANDB_DISABLED"] = "true"')
         combined_dict = {**self.model.config.to_dict(), **self.args.to_sanitized_dict()}
@@ -265,8 +284,8 @@ class TFTrainer:
             COMET_OFFLINE_DIRECTORY:
                 (Optional): str - folder to use for saving offline experiments when `COMET_MODE` is "OFFLINE"
 
-        For a number of configurable items in the environment,
-        see `here <https://www.comet.ml/docs/python-sdk/advanced/#comet-configuration-variables>`__
+        For a number of configurable items in the environment, see `here
+        <https://www.comet.ml/docs/python-sdk/advanced/#comet-configuration-variables>`__
         """
         comet_mode = os.getenv("COMET_MODE", "ONLINE").upper()
         args = {"project_name": os.getenv("COMET_PROJECT_NAME", "huggingface")}
@@ -292,31 +311,24 @@ class TFTrainer:
         prediction_loss_only: Optional[bool] = None,
     ) -> PredictionOutput:
         """
-        Prediction/evaluation loop, shared by :func:`~transformers.TFTrainer.evaluate` and
-        :func:`~transformers.TFTrainer.predict`.
+        Prediction/evaluation loop, shared by [`~TFTrainer.evaluate`] and [`~TFTrainer.predict`].
 
         Works both with or without labels.
         """
-        if hasattr(self, "_prediction_loop"):
-            warnings.warn(
-                "The `_prediction_loop` method is deprecated and won't be called in a future version, define `prediction_loop` in your subclass.",
-                FutureWarning,
-            )
-            return self._prediction_loop(
-                dataset, steps, num_examples, description, prediction_loss_only=prediction_loss_only
-            )
 
         prediction_loss_only = (
             prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
         )
 
-        logger.info("***** Running %s *****", description)
-        logger.info("  Num examples = %d", num_examples)
-        logger.info("  Batch size = %d", self.args.eval_batch_size)
+        logger.info(f"***** Running {description} *****")
+        logger.info(f"  Num examples in dataset = {num_examples}")
+        if description == "Evaluation":
+            logger.info(f"  Num examples in used in evaluation = {self.args.eval_batch_size * steps}")
+        logger.info(f"  Batch size = {self.args.eval_batch_size}")
 
         label_ids: np.ndarray = None
         preds: np.ndarray = None
-        self.eval_loss = tf.keras.metrics.Sum()
+        self.eval_loss.reset_states()
 
         # Reset the past mems state at the beginning of the evaluation if necessary.
         if self.args.past_index >= 0:
@@ -356,7 +368,7 @@ class TFTrainer:
                     else:
                         label_ids = np.append(label_ids, labels.numpy(), axis=0)
 
-                if step == steps:
+                if step == steps - 1:
                     break
 
         if self.compute_metrics is not None and preds is not None and label_ids is not None:
@@ -378,20 +390,14 @@ class TFTrainer:
 
     def log(self, logs: Dict[str, float]) -> None:
         """
-        Log :obj:`logs` on the various objects watching training.
+        Log `logs` on the various objects watching training.
 
         Subclass and override this method to inject custom behavior.
 
         Args:
-            logs (:obj:`Dict[str, float]`):
+            logs (`Dict[str, float]`):
                 The values to log.
         """
-        if hasattr(self, "_log"):
-            warnings.warn(
-                "The `_log` method is deprecated and won't be called in a future version, define `log` in your subclass.",
-                FutureWarning,
-            )
-            return self._log(logs)
         logs["epoch"] = self.epoch_logging
 
         if self.tb_writer:
@@ -418,16 +424,16 @@ class TFTrainer:
         """
         Run evaluation and returns metrics.
 
-        The calling script will be responsible for providing a method to compute metrics, as they are
-        task-dependent (pass it to the init :obj:`compute_metrics` argument).
+        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
+        (pass it to the init `compute_metrics` argument).
 
         Args:
-            eval_dataset (:class:`~tf.data.Dataset`, `optional`):
-                Pass a dataset if you wish to override :obj:`self.eval_dataset`. The dataset should yield tuples of
-                ``(features, labels)`` where ``features`` is a dict of input features and ``labels`` is the labels.
-                If ``labels`` is a tensor, the loss is calculated by the model by calling ``model(features,
-                labels=labels)``. If ``labels`` is a dict, such as when using a QuestionAnswering head model with
-                multiple targets, the loss is instead calculated by calling ``model(features, **labels)``.
+            eval_dataset ([`~tf.data.Dataset`], *optional*):
+                Pass a dataset if you wish to override `self.eval_dataset`. The dataset should yield tuples of
+                `(features, labels)` where `features` is a dict of input features and `labels` is the labels. If
+                `labels` is a tensor, the loss is calculated by the model by calling `model(features, labels=labels)`.
+                If `labels` is a dict, such as when using a QuestionAnswering head model with multiple targets, the
+                loss is instead calculated by calling `model(features, **labels)`.
 
         Returns:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions.
@@ -459,7 +465,6 @@ class TFTrainer:
 
     @tf.function
     def distributed_prediction_steps(self, batch):
-
         nb_instances_in_batch = self._compute_nb_instances(batch)
         inputs = self._get_step_inputs(batch, nb_instances_in_batch)
 
@@ -478,47 +483,57 @@ class TFTrainer:
 
         self.gradient_accumulator.reset()
 
+        num_update_steps_per_epoch = self.num_train_examples / self.total_train_batch_size
+
+        # In fact, ``self.args.dataloader_drop_last`` has no effect in `trainer_tf.py`, because
+        # the dataset is repeated before being batched.
+        # It has the effect only when TPU is used which requires explicit tensor shape in order to make
+        # the gradient accumulation implementation work.
+        approx = math.floor if self.args.dataloader_drop_last else math.ceil
+        num_update_steps_per_epoch = approx(num_update_steps_per_epoch)
+
+        # At least one update for each epoch.
+        num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
+        self.steps_per_epoch = num_update_steps_per_epoch
+
         if self.args.max_steps > 0:
             t_total = self.args.max_steps
-            self.steps_per_epoch = self.args.max_steps
+            epochs = (self.args.max_steps // self.steps_per_epoch) + int(
+                self.args.max_steps % self.steps_per_epoch > 0
+            )
         else:
-            approx = math.floor if self.args.dataloader_drop_last else math.ceil
-            self.steps_per_epoch = approx(self.num_train_examples / self.total_train_batch_size)
             t_total = self.steps_per_epoch * self.args.num_train_epochs
+            epochs = self.args.num_train_epochs
+
+        # Since ``self.args.num_train_epochs`` can be `float`, we make ``epochs`` be a `float` always.
+        epochs = float(epochs)
 
         with self.args.strategy.scope():
             self.create_optimizer_and_scheduler(num_training_steps=t_total)
-            iterations = self.optimizer.iterations
-            self.global_step = iterations.numpy()
             folder = os.path.join(self.args.output_dir, PREFIX_CHECKPOINT_DIR)
             ckpt = tf.train.Checkpoint(optimizer=self.optimizer, model=self.model)
             self.model.ckpt_manager = tf.train.CheckpointManager(ckpt, folder, max_to_keep=self.args.save_total_limit)
 
+            iterations = self.optimizer.iterations
+            epochs_trained = 0
+            steps_trained_in_current_epoch = 0
             if self.model.ckpt_manager.latest_checkpoint:
-                epochs_trained = self.global_step // (self.num_train_examples // self.args.gradient_accumulation_steps)
-                steps_trained_in_current_epoch = self.global_step % (
-                    self.num_train_examples // self.args.gradient_accumulation_steps
+                logger.info(
+                    f"Checkpoint file {self.model.ckpt_manager.latest_checkpoint} found and restoring from checkpoint"
                 )
+                ckpt.restore(self.model.ckpt_manager.latest_checkpoint).expect_partial()
+
+                self.global_step = iterations.numpy()
+
+                epochs_trained = self.global_step // self.steps_per_epoch
+                steps_trained_in_current_epoch = self.global_step % self.steps_per_epoch
 
                 logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-                logger.info("  Continuing training from epoch %d", epochs_trained)
-                logger.info("  Continuing training from global step %d", self.global_step)
-                logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
-                logger.info(
-                    "Checkpoint file %s found and restoring from checkpoint", self.model.ckpt_manager.latest_checkpoint
-                )
+                logger.info(f"  Continuing training from epoch {epochs_trained}")
+                logger.info(f"  Continuing training from global step {self.global_step}")
+                logger.info(f"  Will skip the first {steps_trained_in_current_epoch} steps in the first epoch")
 
-                ckpt.restore(self.model.ckpt_manager.latest_checkpoint).expect_partial()
-            else:
-                epochs_trained = 1
-
-            tf.summary.experimental.set_step(iterations)
-
-            epochs = 1 if self.args.max_steps > 0 else self.args.num_train_epochs
-
-            if self.args.fp16:
-                policy = tf.keras.mixed_precision.experimental.Policy("mixed_float16")
-                tf.keras.mixed_precision.experimental.set_policy(policy)
+            tf.summary.experimental.set_step(self.global_step)
 
             with self.tb_writer.as_default():
                 tf.summary.text("args", self.args.to_json_string())
@@ -526,29 +541,35 @@ class TFTrainer:
             self.tb_writer.flush()
 
             logger.info("***** Running training *****")
-            logger.info("  Num examples = %d", self.num_train_examples)
-            logger.info("  Num Epochs = %d", epochs)
-            logger.info("  Instantaneous batch size per device = %d", self.args.per_device_train_batch_size)
+            logger.info(f"  Num examples = {self.num_train_examples}")
+            # TODO: We might want to print a more precise ``epochs`` if self.args.max_steps > 0 ?
+            logger.info(f"  Num Epochs = {epochs}")
+            logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
             logger.info(
-                "  Total train batch size (w. parallel, distributed & accumulation) = %d", self.total_train_batch_size
+                f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_train_batch_size}"
             )
-            logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
-            logger.info("  Steps per epoch = %d", self.steps_per_epoch)
-            logger.info("  Total optimization steps = %d", t_total)
+            logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+            logger.info(f"  Steps per epoch = {self.steps_per_epoch}")
+            logger.info(f"  Total optimization steps = {t_total}")
 
             self.train_loss = tf.keras.metrics.Sum()
             start_time = datetime.datetime.now()
 
-            for epoch_iter in range(epochs_trained, int(epochs + 1)):
+            for epoch_iter in range(epochs_trained, int(epochs)):
                 # Reset the past mems state at the beginning of each epoch if necessary.
                 if self.args.past_index >= 0:
                     self._past = None
 
                 for step, batch in enumerate(train_ds):
-                    self.global_step = iterations.numpy()
-                    self.epoch_logging = epoch_iter - 1 + (step + 1) / self.steps_per_epoch
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        continue
 
                     self.distributed_training_steps(batch)
+
+                    self.global_step = iterations.numpy()
+                    self.epoch_logging = epoch_iter + (step + 1) / self.steps_per_epoch
 
                     training_loss = self.train_loss.result() / (step + 1)
 
@@ -566,13 +587,13 @@ class TFTrainer:
                             )
 
                     if (
-                        self.global_step > 0
-                        and self.args.evaluate_during_training
+                        self.args.eval_steps > 0
+                        and self.args.evaluation_strategy == IntervalStrategy.STEPS
                         and self.global_step % self.args.eval_steps == 0
                     ):
                         self.evaluate()
 
-                    if (self.global_step > 0 and self.global_step % self.args.logging_steps == 0) or (
+                    if (self.args.logging_steps > 0 and self.global_step % self.args.logging_steps == 0) or (
                         self.global_step == 1 and self.args.logging_first_step
                     ):
                         logs = {}
@@ -582,19 +603,25 @@ class TFTrainer:
 
                         self.log(logs)
 
-                    if self.global_step > 0 and self.global_step % self.args.save_steps == 0:
+                    if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
                         ckpt_save_path = self.model.ckpt_manager.save()
 
-                        logger.info("Saving checkpoint for step {} at {}".format(self.global_step, ckpt_save_path))
+                        logger.info(f"Saving checkpoint for step {self.global_step} at {ckpt_save_path}")
 
-                    if self.global_step > 0 and self.global_step % self.steps_per_epoch == 0:
+                    if self.args.max_steps > 0 and self.global_step >= t_total:
+                        break
+
+                    if self.global_step % self.steps_per_epoch == 0:
                         break
 
                 self.train_loss.reset_states()
 
+                if self.args.max_steps > 0 and self.global_step >= self.args.max_steps:
+                    break
+
             end_time = datetime.datetime.now()
 
-            logger.info("Training took: {}".format(str(end_time - start_time)))
+            logger.info(f"Training took: {str(end_time - start_time)}")
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -631,7 +658,15 @@ class TFTrainer:
                 reduced_features = {
                     k: ft[: self.args.train_batch_size // self.args.n_replicas] for k, ft in features.items()
                 }
-                reduced_labels = labels[: self.args.train_batch_size // self.args.n_replicas]
+
+                if tf.is_tensor(labels):
+                    reduced_labels = labels[: self.args.train_batch_size // self.args.n_replicas]
+                elif isinstance(labels, dict):
+                    reduced_labels = {
+                        k: lbl[: self.args.train_batch_size // self.args.n_replicas] for k, lbl in labels.items()
+                    }
+                else:
+                    raise ValueError("The labels must be either a tf.Tensor or a dict.")
 
                 self.training_step(reduced_features, reduced_labels, nb_instances_in_global_batch)
 
@@ -643,9 +678,20 @@ class TFTrainer:
                     for k, ft in features.items()
                 }
 
-                labels = tf.concat(
-                    [labels[self.args.train_batch_size // self.args.n_replicas :], reduced_labels], axis=0
-                )
+                if tf.is_tensor(labels):
+                    labels = tf.concat(
+                        [labels[self.args.train_batch_size // self.args.n_replicas :], reduced_labels], axis=0
+                    )
+                elif isinstance(labels, dict):
+                    labels = {
+                        k: tf.concat(
+                            [lbl[self.args.train_batch_size // self.args.n_replicas :], reduced_labels[k]],
+                            axis=0,
+                        )
+                        for k, lbl in labels.items()
+                    }
+                else:
+                    raise ValueError("The labels must be either a tf.Tensor or a dict.")
 
             gradients = self.gradient_accumulator.gradients
             gradients = [
@@ -658,7 +704,6 @@ class TFTrainer:
     @tf.function
     def distributed_training_steps(self, batch):
         with self.args.strategy.scope():
-
             nb_instances_in_batch = self._compute_nb_instances(batch)
             inputs = self._get_step_inputs(batch, nb_instances_in_batch)
 
@@ -666,7 +711,6 @@ class TFTrainer:
 
     @staticmethod
     def _compute_nb_instances(batch):
-
         labels = batch[-1]
         if isinstance(labels, PerReplica):
             labels = tf.concat(labels.values, axis=0)
@@ -677,7 +721,6 @@ class TFTrainer:
 
     @staticmethod
     def _get_step_inputs(batch, nb_instances):
-
         features, labels = batch
 
         if isinstance(labels, PerReplica):
@@ -695,19 +738,13 @@ class TFTrainer:
         Subclass and override this method if you want to inject some custom behavior.
 
         Args:
-            features (:obj:`tf.Tensor`): A batch of input features.
-            labels (:obj:`tf.Tensor`): A batch of labels.
-            training (:obj:`bool`): Whether or not to run the model in training mode.
+            features (`tf.Tensor`): A batch of input features.
+            labels (`tf.Tensor`): A batch of labels.
+            training (`bool`): Whether or not to run the model in training mode.
 
         Returns:
-            A tuple of two :obj:`tf.Tensor`: The loss and logits.
+            A tuple of two `tf.Tensor`: The loss and logits.
         """
-        if hasattr(self, "_run_model"):
-            warnings.warn(
-                "The `_run_model` method is deprecated and won't be called in a future version, define `run_model` in your subclass.",
-                FutureWarning,
-            )
-            return self._run_model(features, labels, training)
 
         if self.args.past_index >= 0 and getattr(self, "_past", None) is not None:
             features["mems"] = self._past
@@ -728,24 +765,23 @@ class TFTrainer:
         """
         Run prediction and returns predictions and potential metrics.
 
-        Depending on the dataset and your use case, your test dataset may contain labels.
-        In that case, this method will also return metrics, like in :obj:`evaluate()`.
+        Depending on the dataset and your use case, your test dataset may contain labels. In that case, this method
+        will also return metrics, like in `evaluate()`.
 
         Args:
-            test_dataset (:class:`~tf.data.Dataset`):
-                Dataset to run the predictions on. The dataset should yield tuples of ``(features, labels)`` where
-                ``features`` is a dict of input features and ``labels`` is the labels. If ``labels`` is a tensor,
-                the loss is calculated by the model by calling ``model(features, labels=labels)``. If ``labels`` is
-                a dict, such as when using a QuestionAnswering head model with multiple targets, the loss is instead
-                calculated by calling ``model(features, **labels)``.
-        Returns:
-            `NamedTuple`:
-            predictions (:obj:`np.ndarray`):
-                The predictions on :obj:`test_dataset`.
-            label_ids (:obj:`np.ndarray`, `optional`):
-                The labels (if the dataset contained some).
-            metrics (:obj:`Dict[str, float]`, `optional`):
-                The potential dictionary of metrics (if the dataset contained labels).
+            test_dataset ([`~tf.data.Dataset`]):
+                Dataset to run the predictions on. The dataset should yield tuples of `(features, labels)` where
+                `features` is a dict of input features and `labels` is the labels. If `labels` is a tensor, the loss is
+                calculated by the model by calling `model(features, labels=labels)`. If `labels` is a dict, such as
+                when using a QuestionAnswering head model with multiple targets, the loss is instead calculated by
+                calling `model(features, **labels)`
+
+        Returns: *NamedTuple* A namedtuple with the following keys:
+
+            - predictions (`np.ndarray`): The predictions on `test_dataset`.
+            - label_ids (`np.ndarray`, *optional*): The labels (if the dataset contained some).
+            - metrics (`Dict[str, float]`, *optional*): The potential dictionary of metrics (if the dataset contained
+              labels).
         """
         test_ds, steps, num_examples = self.get_test_tfdataset(test_dataset)
 
@@ -753,11 +789,11 @@ class TFTrainer:
 
     def save_model(self, output_dir: Optional[str] = None):
         """
-        Will save the model, so you can reload it using :obj:`from_pretrained()`.
+        Will save the model, so you can reload it using `from_pretrained()`.
         """
         output_dir = output_dir if output_dir is not None else self.args.output_dir
 
-        logger.info("Saving model in {}".format(output_dir))
+        logger.info(f"Saving model in {output_dir}")
 
         if not isinstance(self.model, TFPreTrainedModel):
             raise ValueError("Trainer.model appears to not be a PreTrainedModel")

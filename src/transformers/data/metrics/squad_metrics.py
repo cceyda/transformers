@@ -1,10 +1,23 @@
-""" Very heavily inspired by the official evaluation script for SQuAD version 2.0 which was
-modified by XLNet authors to update `find_best_threshold` scripts for SQuAD V2.0
+# Copyright 2020 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Very heavily inspired by the official evaluation script for SQuAD version 2.0 which was modified by XLNet authors to
+update `find_best_threshold` scripts for SQuAD V2.0
 
-In addition to basic functionality, we also compute additional statistics and
-plot precision-recall curves if an additional na_prob.json file is provided.
-This file is expected to map question ID's to the model's predicted probability
-that a question is unanswerable.
+In addition to basic functionality, we also compute additional statistics and plot precision-recall curves if an
+additional na_prob.json file is provided. This file is expected to map question ID's to the model's predicted
+probability that a question is unanswerable.
 """
 
 
@@ -14,8 +27,7 @@ import math
 import re
 import string
 
-from transformers.tokenization_bert import BasicTokenizer
-
+from ...models.bert import BasicTokenizer
 from ...utils import logging
 
 
@@ -84,7 +96,7 @@ def get_raw_scores(examples, preds):
             gold_answers = [""]
 
         if qas_id not in preds:
-            print("Missing prediction for %s" % qas_id)
+            print(f"Missing prediction for {qas_id}")
             continue
 
         prediction = preds[qas_id]
@@ -128,7 +140,7 @@ def make_eval_dict(exact_scores, f1_scores, qid_list=None):
 
 def merge_eval(main_eval, new_eval, prefix):
     for k in new_eval:
-        main_eval["%s_%s" % (prefix, k)] = new_eval[k]
+        main_eval[f"{prefix}_{k}"] = new_eval[k]
 
 
 def find_best_thresh_v2(preds, scores, na_probs, qid_to_has_ans):
@@ -271,7 +283,7 @@ def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
     def _strip_spaces(text):
         ns_chars = []
         ns_to_s_map = collections.OrderedDict()
-        for (i, c) in enumerate(text):
+        for i, c in enumerate(text):
             if c == " ":
                 continue
             ns_to_s_map[len(ns_chars)] = i
@@ -290,7 +302,7 @@ def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
     start_position = tok_text.find(pred_text)
     if start_position == -1:
         if verbose_logging:
-            logger.info("Unable to find text: '%s' in '%s'" % (pred_text, orig_text))
+            logger.info(f"Unable to find text: '{pred_text}' in '{orig_text}'")
         return orig_text
     end_position = start_position + len(pred_text) - 1
 
@@ -299,13 +311,13 @@ def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
 
     if len(orig_ns_text) != len(tok_ns_text):
         if verbose_logging:
-            logger.info("Length not equal after stripping spaces: '%s' vs '%s'", orig_ns_text, tok_ns_text)
+            logger.info(f"Length not equal after stripping spaces: '{orig_ns_text}' vs '{tok_ns_text}'")
         return orig_text
 
     # We then project the characters in `pred_text` back to `orig_text` using
     # the character-to-character alignment.
     tok_s_to_ns_map = {}
-    for (i, tok_index) in tok_ns_to_s_map.items():
+    for i, tok_index in tok_ns_to_s_map.items():
         tok_s_to_ns_map[tok_index] = i
 
     orig_start_position = None
@@ -408,7 +420,7 @@ def compute_predictions_logits(
     all_nbest_json = collections.OrderedDict()
     scores_diff_json = collections.OrderedDict()
 
-    for (example_index, example) in enumerate(all_examples):
+    for example_index, example in enumerate(all_examples):
         features = example_index_to_features[example_index]
 
         prelim_predictions = []
@@ -417,7 +429,7 @@ def compute_predictions_logits(
         min_null_feature_index = 0  # the paragraph slice with min null score
         null_start_logit = 0  # the start logit at the slice with min null score
         null_end_logit = 0  # the end logit at the slice with min null score
-        for (feature_index, feature) in enumerate(features):
+        for feature_index, feature in enumerate(features):
             result = unique_id_to_result[feature.unique_id]
             start_indexes = _get_best_indexes(result.start_logits, n_best_size)
             end_indexes = _get_best_indexes(result.end_logits, n_best_size)
@@ -524,7 +536,8 @@ def compute_predictions_logits(
         if not nbest:
             nbest.append(_NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
 
-        assert len(nbest) >= 1, "No valid predictions"
+        if len(nbest) < 1:
+            raise ValueError("No valid predictions")
 
         total_scores = []
         best_non_null_entry = None
@@ -537,7 +550,7 @@ def compute_predictions_logits(
         probs = _compute_softmax(total_scores)
 
         nbest_json = []
-        for (i, entry) in enumerate(nbest):
+        for i, entry in enumerate(nbest):
             output = collections.OrderedDict()
             output["text"] = entry.text
             output["probability"] = probs[i]
@@ -545,7 +558,8 @@ def compute_predictions_logits(
             output["end_logit"] = entry.end_logit
             nbest_json.append(output)
 
-        assert len(nbest_json) >= 1, "No valid predictions"
+        if len(nbest_json) < 1:
+            raise ValueError("No valid predictions")
 
         if not version_2_with_negative:
             all_predictions[example.qas_id] = nbest_json[0]["text"]
@@ -589,8 +603,9 @@ def compute_predictions_log_probs(
     tokenizer,
     verbose_logging,
 ):
-    """XLNet write prediction logic (more complex than Bert's).
-    Write final predictions to the json file and log-odds of null if needed.
+    """
+    XLNet write prediction logic (more complex than Bert's). Write final predictions to the json file and log-odds of
+    null if needed.
 
     Requires utils_squad_evaluate.py
     """
@@ -602,8 +617,7 @@ def compute_predictions_log_probs(
         "NbestPrediction", ["text", "start_log_prob", "end_log_prob"]
     )
 
-    logger.info("Writing predictions to: %s", output_prediction_file)
-    # logger.info("Writing nbest to: %s" % (output_nbest_file))
+    logger.info(f"Writing predictions to: {output_prediction_file}")
 
     example_index_to_features = collections.defaultdict(list)
     for feature in all_features:
@@ -617,14 +631,14 @@ def compute_predictions_log_probs(
     all_nbest_json = collections.OrderedDict()
     scores_diff_json = collections.OrderedDict()
 
-    for (example_index, example) in enumerate(all_examples):
+    for example_index, example in enumerate(all_examples):
         features = example_index_to_features[example_index]
 
         prelim_predictions = []
         # keep track of the minimum score of null start+end of position 0
         score_null = 1000000  # large and positive
 
-        for (feature_index, feature) in enumerate(features):
+        for feature_index, feature in enumerate(features):
             result = unique_id_to_result[feature.unique_id]
 
             cur_null_score = result.cls_logits
@@ -732,7 +746,7 @@ def compute_predictions_log_probs(
         probs = _compute_softmax(total_scores)
 
         nbest_json = []
-        for (i, entry) in enumerate(nbest):
+        for i, entry in enumerate(nbest):
             output = collections.OrderedDict()
             output["text"] = entry.text
             output["probability"] = probs[i]
@@ -740,8 +754,10 @@ def compute_predictions_log_probs(
             output["end_log_prob"] = entry.end_log_prob
             nbest_json.append(output)
 
-        assert len(nbest_json) >= 1, "No valid predictions"
-        assert best_non_null_entry is not None, "No valid predictions"
+        if len(nbest_json) < 1:
+            raise ValueError("No valid predictions")
+        if best_non_null_entry is None:
+            raise ValueError("No valid predictions")
 
         score_diff = score_null
         scores_diff_json[example.qas_id] = score_diff
